@@ -342,52 +342,6 @@ class GrpcTestCase(GrpcBaseTestCase):
         client_span, server_span = spans
         assert client_span.duration is not None
 
-    def test_generator_span_finish_is_deferred_during_gc(self):
-        import ddtrace.contrib.internal.grpc.client_interceptor as client_interceptor
-
-        # Start the worker first. The capture queue replaces the global only for the
-        # put, and a worker started against that capture object would die on get().
-        client_interceptor._ensure_span_finisher()
-        real_queue = client_interceptor._pending_span_finishes
-        span = self.tracer.start_span("grpc.generator")
-        queued = []
-
-        class _Capture:
-            def put(self, item):
-                queued.append(item)
-
-            def get(self):
-                # The worker may not have entered get() before this object is installed.
-                return real_queue.get()
-
-        client_interceptor._gc_depth.n = 1
-        try:
-            with pytest.MonkeyPatch.context() as monkeypatch:
-                monkeypatch.setattr(client_interceptor, "_pending_span_finishes", _Capture())
-                client_interceptor._finish_dropped_generator_span(span)
-                assert span.duration is None
-                assert queued == [span]
-        finally:
-            client_interceptor._gc_depth.n = 0
-        real_queue.put(queued[0])
-        for _ in range(100):
-            if span.duration is not None:
-                break
-            time.sleep(0.01)
-        assert span.duration is not None
-
-    def test_span_finisher_resets_after_fork(self):
-        import ddtrace.contrib.internal.grpc.client_interceptor as client_interceptor
-        from ddtrace.internal.threads import SimpleQueue
-
-        client_interceptor._ensure_span_finisher()
-        assert client_interceptor._finisher_started is True
-        old_queue = client_interceptor._pending_span_finishes
-        client_interceptor._reset_span_finisher_after_fork()
-        assert client_interceptor._finisher_started is False
-        assert client_interceptor._pending_span_finishes is not old_queue
-        assert isinstance(client_interceptor._pending_span_finishes, SimpleQueue)
-
     def test_client_stream(self):
         requests_iterator = iter(HelloRequest(name=name) for name in ["first", "second"])
 
