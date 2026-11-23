@@ -1,7 +1,6 @@
 import collections
 from contextlib import contextmanager
 import gc
-import queue
 import threading
 import weakref
 
@@ -21,8 +20,10 @@ from ddtrace.contrib.internal.trace_utils import set_service_and_source
 from ddtrace.ext import SpanKind
 from ddtrace.ext import SpanTypes
 from ddtrace.internal import core
+from ddtrace.internal import forksafe
 from ddtrace.internal.constants import COMPONENT
 from ddtrace.internal.logger import get_logger
+from ddtrace.internal.threads import SimpleQueue
 from ddtrace.internal.schema import schematize_url_operation
 from ddtrace.internal.schema.span_attribute_schema import SpanDirection
 from ddtrace.propagation.http import HTTPPropagator
@@ -36,8 +37,10 @@ log = get_logger(__name__)
 # already hold telemetry's non-reentrant _recorder_lock, and span.finish() takes it.
 # A refcount drop runs the finalizer outside GC and finishes inline. During collection
 # the span is handed to a daemon thread instead.
+# SimpleQueue, not queue.Queue: Queue.get allocates its waiter while holding the
+# queue mutex, so a finalizer put on that same thread deadlocks the worker.
 _gc_depth = threading.local()
-_pending_span_finishes = queue.Queue()
+_pending_span_finishes = SimpleQueue()
 _finisher_started = False
 _finisher_lock = threading.Lock()
 
@@ -61,8 +64,18 @@ def _span_finisher():
             span.finish()
         except Exception:
             log.debug("error finishing dropped grpc generator span", exc_info=True)
-        finally:
-            _pending_span_finishes.task_done()
+
+
+def _reset_span_finisher_after_fork():
+    # The daemon thread does not survive fork, but _finisher_started would stay true
+    # and the copied queue lock may be held. Drop both so the child can start a worker.
+    global _finisher_started, _pending_span_finishes, _finisher_lock
+    _finisher_started = False
+    _pending_span_finishes = SimpleQueue()
+    _finisher_lock = threading.Lock()
+
+
+forksafe.register(_reset_span_finisher_after_fork)
 
 
 def _ensure_span_finisher():
@@ -82,6 +95,7 @@ def _finish_dropped_generator_span(span):
         _pending_span_finishes.put(span)
         return
     span.finish()
+
 
 # DEV: Follows Python interceptors RFC laid out in
 # https://github.com/grpc/proposal/blob/master/L13-python-interceptors.md
