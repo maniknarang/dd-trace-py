@@ -356,6 +356,10 @@ class GrpcTestCase(GrpcBaseTestCase):
             def put(self, item):
                 queued.append(item)
 
+            def get(self):
+                # The worker may not have entered get() before this object is installed.
+                return real_queue.get()
+
         client_interceptor._gc_depth.n = 1
         try:
             with pytest.MonkeyPatch.context() as monkeypatch:
