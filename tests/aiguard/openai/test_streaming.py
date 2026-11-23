@@ -484,7 +484,8 @@ class _NoVerdict(BaseException):
     """Ends an evaluation without a verdict, like a timeout raised inside the AI Guard call."""
 
 
-def test_buffered_stream_evaluates_the_buffer_again_without_verdict():
+@pytest.mark.parametrize("later", ["unchanged", "analysis_off", "claim"])
+def test_buffered_stream_evaluates_the_buffer_again_without_verdict(later, request):
     """An evaluation that ends without a verdict keeps the drained buffer, and the next read evaluates it."""
     evaluated = []
 
@@ -493,28 +494,37 @@ def test_buffered_stream_evaluates_the_buffer_again_without_verdict():
         if len(evaluated) == 1:
             raise _NoVerdict()
 
-    stream = BufferedAIGuardStream(_SyncFinalMessageStream(), reconstruct=list, evaluate=evaluate, enabled=lambda: True)
+    analysis = {"enabled": True}
+    stream = BufferedAIGuardStream(
+        _SyncFinalMessageStream(), reconstruct=list, evaluate=evaluate, enabled=lambda: analysis["enabled"]
+    )
 
     with pytest.raises(_NoVerdict):
         list(stream)
+    # Pass-through is decided on first use, so turning analysis off or claiming the call skips nothing now.
+    analysis["enabled"] = later != "analysis_off"
+    if later == "claim":
+        request.getfixturevalue("aiguard_active_context")
     assert list(stream) == ["a", "b"]
     assert evaluated == [["a", "b"], ["a", "b"]]
 
 
 @pytest.mark.asyncio
-async def test_async_buffered_stream_evaluates_the_buffer_again_after_cancel():
-    """A cancelled evaluation leaves the buffer pending: the snapshot is refused and the next read evaluates it."""
+@pytest.mark.parametrize("verdict", ["allow", "deny"])
+async def test_async_buffered_stream_cancelled_reader_shares_the_evaluation(verdict):
+    """A reader cancelled during the evaluation leaves it running: the next reader gets its verdict, not a new one."""
     evaluated = []
     started, release = threading.Event(), threading.Event()
 
     def evaluate(response):
         evaluated.append(response)
-        if len(evaluated) == 1:
-            # Allows once released, but the awaiting task is cancelled by then: this verdict is discarded.
+        first = len(evaluated) == 1
+        if first:
             started.set()
             release.wait(5)
-            return
-        raise AIGuardAbortError(action="DENY", reason="blocked")
+        # The first evaluation gives the verdict under test; a second one would give the other verdict.
+        if first == (verdict == "deny"):
+            raise AIGuardAbortError(action="DENY", reason="blocked")
 
     stream = BufferedAIGuardAsyncStream(
         _FinalMessageStream(), reconstruct=list, evaluate=evaluate, enabled=lambda: True
@@ -522,19 +532,41 @@ async def test_async_buffered_stream_evaluates_the_buffer_again_after_cancel():
     reading = asyncio.ensure_future(stream.get_final_message())
     try:
         assert await asyncio.to_thread(started.wait, 5)
-        with pytest.raises(asyncio.TimeoutError):
-            await asyncio.wait_for(reading, 0.01)
+        reading.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await reading
+        later = asyncio.ensure_future(stream.get_final_message())
+        await asyncio.sleep(0.05)
+        with pytest.raises(RuntimeError):
+            _ = stream.current_message_snapshot
     finally:
         release.set()
-    assert reading.cancelled()
 
-    with pytest.raises(RuntimeError):
-        _ = stream.current_message_snapshot
-    with pytest.raises(AIGuardAbortError):
-        await stream.get_final_message()
-    with pytest.raises(AIGuardAbortError):
-        _ = stream.current_message_snapshot
-    assert evaluated == [["a", "b"], ["a", "b"]]
+    if verdict == "deny":
+        with pytest.raises(AIGuardAbortError):
+            await later
+        with pytest.raises(AIGuardAbortError):
+            _ = stream.current_message_snapshot
+    else:
+        assert await later == "full message"
+        assert stream.current_message_snapshot == "full message"
+    assert evaluated == [["a", "b"]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["analysis_off", "claim"])
+async def test_async_buffered_stream_snapshot_first_passthrough(mode, request):
+    """A pass-through stream returns the SDK snapshot even when the snapshot is its first read."""
+    evaluated = []
+    if mode == "claim":
+        request.getfixturevalue("aiguard_active_context")
+    stream = BufferedAIGuardAsyncStream(
+        _FinalMessageStream(), reconstruct=list, evaluate=evaluated.append, enabled=lambda: mode != "analysis_off"
+    )
+
+    assert stream.current_message_snapshot == "full message"
+    assert await _async_iterate(stream) == ["a", "b"]
+    assert evaluated == []
 
 
 @pytest.mark.asyncio

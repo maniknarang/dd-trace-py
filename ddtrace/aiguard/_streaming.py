@@ -136,18 +136,20 @@ class BufferedAIGuardStream(wrapt.ObjectProxy):  # type: ignore[misc]  # wrapt s
         self._self_buffer: Optional[list[Any]] = None
         # Every later read raises this block again, without a new evaluation.
         self._self_block: Optional[AIGuardAbortError] = None
-        self._self_passthrough: bool = False
+        self._self_passthrough: Optional[bool] = None
         self._self_index: int = 0
+
+    def _is_passthrough(self) -> bool:
+        # Decided once, on the first read: a stream that started buffering is always evaluated.
+        if self._self_passthrough is None:
+            self._self_passthrough = not self._self_enabled() or is_aiguard_context_active()
+        return self._self_passthrough
 
     def _drained(self) -> Optional[list[Any]]:
         _raise_remembered_block(self._self_block)
-        if self._self_passthrough:
+        if self._is_passthrough():
             return None
         if self._self_chunks is None:
-            # The flag and the framework claim only decide before the first drain: a drained response is evaluated.
-            if self._self_buffer is None and (not self._self_enabled() or is_aiguard_context_active()):
-                self._self_passthrough = True
-                return None
             self._drain_and_evaluate()
         return self._self_chunks
 
@@ -272,23 +274,27 @@ class BufferedAIGuardAsyncStream(wrapt.ObjectProxy):  # type: ignore[misc]  # wr
         self._self_evaluate = evaluate
         self._self_enabled = enabled
         self._self_chunks: Optional[list[Any]] = None
-        # Drained but not yet allowed: a cancelled evaluation, or another one without a verdict, is retried on it.
+        # Drained but not yet allowed: the evaluation runs on this buffer.
         self._self_buffer: Optional[list[Any]] = None
         # Every later read raises this block again, without a new evaluation.
         self._self_block: Optional[AIGuardAbortError] = None
+        # One evaluation shared by every reader, so a cancelled reader does not make the next one start another.
+        self._self_evaluation: Optional[asyncio.Future[None]] = None
         self._self_lock: Optional[asyncio.Lock] = None
-        self._self_passthrough: bool = False
+        self._self_passthrough: Optional[bool] = None
         self._self_index: int = 0
+
+    def _is_passthrough(self) -> bool:
+        # Decided once, on the first read: a stream that started buffering is always evaluated.
+        if self._self_passthrough is None:
+            self._self_passthrough = not self._self_enabled() or is_aiguard_context_active()
+        return self._self_passthrough
 
     async def _drained(self) -> Optional[list[Any]]:
         _raise_remembered_block(self._self_block)
-        if self._self_passthrough:
+        if self._is_passthrough():
             return None
         if self._self_chunks is None:
-            # The flag and the framework claim only decide before the first drain: a drained response is evaluated.
-            if self._self_buffer is None and (not self._self_enabled() or is_aiguard_context_active()):
-                self._self_passthrough = True
-                return None
             try:
                 asyncio.get_running_loop()
             except RuntimeError:
@@ -309,18 +315,27 @@ class BufferedAIGuardAsyncStream(wrapt.ObjectProxy):  # type: ignore[misc]  # wr
         _raise_remembered_block(self._self_block)
         if self._self_buffer is None:
             self._self_buffer = [chunk async for chunk in self.__wrapped__]
-        try:
-            if off_loop:
+        if not off_loop:
+            self._evaluate_buffer(self._self_buffer)
+        else:
+            if self._self_evaluation is None:
                 # The evaluation is a blocking HTTP call: run it off the event loop (contextvars are copied).
-                await asyncio.to_thread(
-                    _reconstruct_and_evaluate, self._self_reconstruct, self._self_evaluate, self._self_buffer
+                self._self_evaluation = asyncio.ensure_future(
+                    asyncio.to_thread(self._evaluate_buffer, self._self_buffer)
                 )
-            else:
-                _reconstruct_and_evaluate(self._self_reconstruct, self._self_evaluate, self._self_buffer)
+            # Shielded: cancelling this reader leaves the evaluation running, and the next reader gets its verdict.
+            await asyncio.shield(self._self_evaluation)
+        _raise_remembered_block(self._self_block)
+
+    def _evaluate_buffer(self, buffer: list[Any]) -> None:
+        """Evaluate the drained buffer and record its verdict, inline or in a worker thread."""
+        try:
+            _reconstruct_and_evaluate(self._self_reconstruct, self._self_evaluate, buffer)
         except AIGuardAbortError as e:
+            # Recorded, not raised, so a verdict nobody awaits is not logged as an unretrieved task exception.
             self._self_block = e
-            raise
-        self._self_chunks = self._self_buffer
+        else:
+            self._self_chunks = buffer
 
     def __aiter__(self) -> "BufferedAIGuardAsyncStream":
         return self
@@ -381,7 +396,7 @@ class BufferedAIGuardAsyncStream(wrapt.ObjectProxy):  # type: ignore[misc]  # wr
     @property
     def current_message_snapshot(self) -> Any:
         _raise_remembered_block(self._self_block)
-        if self._self_passthrough or self._self_chunks is not None:
+        if self._is_passthrough() or self._self_chunks is not None:
             return self.__wrapped__.current_message_snapshot
         # A property cannot await the evaluation, and an AttributeError would make wrapt return the SDK snapshot.
         raise RuntimeError("AI Guard has not evaluated this streamed response yet; await get_final_message() first")
