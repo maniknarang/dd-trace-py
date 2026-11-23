@@ -1,12 +1,16 @@
 """Streaming AI Guard tests for the Anthropic SDK."""
 
+import contextlib
+import json
 from unittest.mock import patch
 
+import httpx
 import pytest
 
 from ddtrace.aiguard import AIGuardAbortError
 from ddtrace.aiguard._streaming import BufferedAIGuardStream
 from tests.aiguard.utils import mock_evaluate_response
+from tests.aiguard.utils import override_ai_guard_config
 
 
 CHAT_MODEL = "claude-3-opus-20240229"
@@ -283,6 +287,327 @@ def test_wrappers_installed_when_flag_on(mock_execute_request, anthropic_client_
     result = anthropic_client_stream_buffered.messages.create(messages=_user_messages(), stream=True, **CHAT_PARAMS)
     assert isinstance(result, BufferedAIGuardStream)
     list(result)
+
+
+# ---------------------------------------------------------------------------
+# Reads after a caught response block
+# ---------------------------------------------------------------------------
+
+
+def _block_then_allow():
+    """Verdicts: the prompt is allowed, the response is blocked, and any later evaluation would allow."""
+    return [mock_evaluate_response("ALLOW"), mock_evaluate_response("DENY")] + [
+        mock_evaluate_response("ALLOW") for _ in range(3)
+    ]
+
+
+_SYNC_READS = {
+    "iterate": lambda stream: list(stream),
+    "next": lambda stream: next(stream, None),
+    "text_stream": lambda stream: list(stream.text_stream),
+    "get_final_message": lambda stream: stream.get_final_message(),
+    "get_final_text": lambda stream: stream.get_final_text(),
+    "until_done": lambda stream: stream.until_done(),
+    "current_message_snapshot": lambda stream: stream.current_message_snapshot,
+}
+
+
+async def _async_iterate(stream):
+    return [chunk async for chunk in stream]
+
+
+async def _async_next(stream):
+    """Like next(stream, None) for an async stream."""
+    try:
+        return await stream.__anext__()
+    except StopAsyncIteration:
+        return None
+
+
+async def _async_text_stream(stream):
+    return [text async for text in stream.text_stream]
+
+
+async def _async_snapshot(stream):
+    return stream.current_message_snapshot
+
+
+_ASYNC_READS = {
+    "iterate": _async_iterate,
+    "next": _async_next,
+    "text_stream": _async_text_stream,
+    "get_final_message": lambda stream: stream.get_final_message(),
+    "get_final_text": lambda stream: stream.get_final_text(),
+    "until_done": lambda stream: stream.until_done(),
+    "current_message_snapshot": _async_snapshot,
+}
+
+
+@pytest.mark.parametrize("read", list(_SYNC_READS))
+@patch("ddtrace.aiguard._api_client.AIGuardClient._execute_request")
+def test_stream_sync_read_after_caught_block(
+    mock_execute_request, anthropic_sdk_buffered, anthropic_client_stream_buffered, read
+):
+    """Once the caller catches the block, every later read of the stream raises it again, without a new evaluation."""
+    mock_execute_request.side_effect = _block_then_allow()
+
+    with anthropic_client_stream_buffered.messages.stream(messages=_user_messages(), **CHAT_PARAMS) as stream:
+        with pytest.raises(anthropic_sdk_buffered.APIStatusError) as caught:
+            for _ in stream:
+                pass
+        with pytest.raises(AIGuardAbortError) as again:
+            _SYNC_READS[read](stream)
+
+    assert type(again.value) is type(caught.value)
+    assert isinstance(again.value, anthropic_sdk_buffered.APIStatusError)
+    assert mock_execute_request.call_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("read", list(_ASYNC_READS))
+@patch("ddtrace.aiguard._api_client.AIGuardClient._execute_request")
+async def test_stream_async_read_after_caught_block(
+    mock_execute_request, anthropic_sdk_buffered, async_anthropic_client_stream_buffered, read
+):
+    """Async twin: once the caller catches the block, every later read raises it again, without a new evaluation."""
+    mock_execute_request.side_effect = _block_then_allow()
+
+    async with async_anthropic_client_stream_buffered.messages.stream(
+        messages=_user_messages(), **CHAT_PARAMS
+    ) as stream:
+        with pytest.raises(anthropic_sdk_buffered.APIStatusError) as caught:
+            async for _ in stream:
+                pass
+        with pytest.raises(AIGuardAbortError) as again:
+            await _ASYNC_READS[read](stream)
+
+    assert type(again.value) is type(caught.value)
+    assert isinstance(again.value, anthropic_sdk_buffered.APIStatusError)
+    assert mock_execute_request.call_count == 2
+
+
+@patch("ddtrace.aiguard._api_client.AIGuardClient._execute_request")
+def test_create_stream_true_sync_read_after_caught_block(
+    mock_execute_request, anthropic_sdk_buffered, anthropic_client_stream_buffered
+):
+    """Iterating a blocked create(stream=True) stream again raises the block instead of yielding nothing."""
+    mock_execute_request.side_effect = _block_then_allow()
+
+    stream = anthropic_client_stream_buffered.messages.create(messages=_user_messages(), stream=True, **CHAT_PARAMS)
+    with pytest.raises(anthropic_sdk_buffered.APIStatusError):
+        list(stream)
+    with pytest.raises(AIGuardAbortError):
+        list(stream)
+
+    assert mock_execute_request.call_count == 2
+
+
+@pytest.mark.asyncio
+@patch("ddtrace.aiguard._api_client.AIGuardClient._execute_request")
+async def test_create_stream_true_async_read_after_caught_block(
+    mock_execute_request, anthropic_sdk_buffered, async_anthropic_client_stream_buffered
+):
+    """Iterating a blocked async create(stream=True) stream again raises the block without a new evaluation."""
+    mock_execute_request.side_effect = _block_then_allow()
+
+    stream = await async_anthropic_client_stream_buffered.messages.create(
+        messages=_user_messages(), stream=True, **CHAT_PARAMS
+    )
+    with pytest.raises(anthropic_sdk_buffered.APIStatusError):
+        await _async_iterate(stream)
+    with pytest.raises(AIGuardAbortError):
+        await _async_iterate(stream)
+
+    assert mock_execute_request.call_count == 2
+
+
+@patch("ddtrace.aiguard._api_client.AIGuardClient._execute_request")
+def test_stream_sync_snapshot_after_allow(mock_execute_request, anthropic_client_stream_buffered):
+    """An allowed response keeps its message snapshot."""
+    mock_execute_request.return_value = mock_evaluate_response("ALLOW")
+
+    with anthropic_client_stream_buffered.messages.stream(messages=_user_messages(), **CHAT_PARAMS) as stream:
+        list(stream)
+        snapshot = stream.current_message_snapshot
+
+    assert snapshot.content[0].text == "ok"
+    assert mock_execute_request.call_count == 2
+
+
+@pytest.mark.asyncio
+@patch("ddtrace.aiguard._api_client.AIGuardClient._execute_request")
+async def test_stream_async_snapshot_after_allow(mock_execute_request, async_anthropic_client_stream_buffered):
+    """An allowed async response keeps its message snapshot."""
+    mock_execute_request.return_value = mock_evaluate_response("ALLOW")
+
+    async with async_anthropic_client_stream_buffered.messages.stream(
+        messages=_user_messages(), **CHAT_PARAMS
+    ) as stream:
+        await _async_iterate(stream)
+        snapshot = stream.current_message_snapshot
+
+    assert snapshot.content[0].text == "ok"
+    assert mock_execute_request.call_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["flag_off", "claim"])
+@pytest.mark.parametrize("api", ["sync", "async"])
+@patch("ddtrace.aiguard._api_client.AIGuardClient._execute_request")
+async def test_stream_snapshot_passthrough(mock_execute_request, request, api, mode):
+    """A pass-through stream (analysis off at first use, or a framework claim) returns the SDK snapshot."""
+    mock_execute_request.return_value = mock_evaluate_response("ALLOW")
+    # The buffered fixtures turn stream analysis on, so request them before turning it off.
+    client = request.getfixturevalue(
+        "anthropic_client_stream_buffered" if api == "sync" else "async_anthropic_client_stream_buffered"
+    )
+    if mode == "claim":
+        request.getfixturevalue("aiguard_active_context")
+        analysis = contextlib.nullcontext()
+    else:
+        analysis = override_ai_guard_config(dict(_ai_guard_analyze_stream_responses_enabled=False))
+
+    with analysis:
+        if api == "sync":
+            with client.messages.stream(messages=_user_messages(), **CHAT_PARAMS) as stream:
+                list(stream)
+                snapshot = stream.current_message_snapshot
+        else:
+            async with client.messages.stream(messages=_user_messages(), **CHAT_PARAMS) as stream:
+                await _async_iterate(stream)
+                snapshot = stream.current_message_snapshot
+
+    assert snapshot.content[0].text == "ok"
+    # Only the prompt is evaluated with the flag off; a framework claim skips the prompt too.
+    assert mock_execute_request.call_count == (1 if mode == "flag_off" else 0)
+
+
+# ---------------------------------------------------------------------------
+# Streaming tool runner: the loop body catches the block of a streamed answer
+# ---------------------------------------------------------------------------
+
+
+def _sse(event, data):
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode()
+
+
+def _streamed_message(block, stop_reason):
+    """The SSE body of an assistant message with a single text or tool_use block."""
+    if block["type"] == "text":
+        start, delta = {"type": "text", "text": ""}, {"type": "text_delta", "text": block["text"]}
+    else:
+        start = dict(block, input={})
+        delta = {"type": "input_json_delta", "partial_json": json.dumps(block["input"])}
+    message = {
+        "id": "msg_runner",
+        "type": "message",
+        "role": "assistant",
+        "model": CHAT_MODEL,
+        "content": [],
+        "stop_reason": None,
+        "stop_sequence": None,
+        "usage": {"input_tokens": 1, "output_tokens": 0},
+    }
+    message_delta = {"stop_reason": stop_reason, "stop_sequence": None}
+    return b"".join(
+        [
+            _sse("message_start", {"type": "message_start", "message": message}),
+            _sse("content_block_start", {"type": "content_block_start", "index": 0, "content_block": start}),
+            _sse("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": delta}),
+            _sse("content_block_stop", {"type": "content_block_stop", "index": 0}),
+            _sse("message_delta", {"type": "message_delta", "delta": message_delta, "usage": {"output_tokens": 1}}),
+            _sse("message_stop", {"type": "message_stop"}),
+        ]
+    )
+
+
+class _RunnerTransport(httpx.BaseTransport, httpx.AsyncBaseTransport):
+    """Streams a turn that calls delete_records, then a final text turn."""
+
+    def __init__(self):
+        tool_use = {"type": "tool_use", "id": "toolu_runner", "name": "delete_records", "input": {"table": "users"}}
+        self._bodies = [
+            _streamed_message(tool_use, "tool_use"),
+            _streamed_message({"type": "text", "text": "done"}, "end_turn"),
+        ]
+
+    def _response(self):
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=self._bodies.pop(0))
+
+    def handle_request(self, request):
+        return self._response()
+
+    async def handle_async_request(self, request):
+        return self._response()
+
+
+@patch("ddtrace.aiguard._api_client.AIGuardClient._execute_request")
+def test_streaming_tool_runner_sync_after_caught_block(mock_execute_request, anthropic_sdk_buffered):
+    """A runner loop that catches the block of a streamed answer never runs the tool calls of that answer."""
+    if not hasattr(anthropic_sdk_buffered, "beta_tool"):
+        pytest.skip("the streaming tool runner needs the beta tool helpers")
+    mock_execute_request.side_effect = _block_then_allow()
+    deleted = []
+
+    @anthropic_sdk_buffered.beta_tool
+    def delete_records(table: str) -> str:
+        """Delete every record of a table."""
+        deleted.append(table)
+        return "deleted"
+
+    client = anthropic_sdk_buffered.Anthropic(
+        api_key="<not-a-real-key>", http_client=httpx.Client(transport=_RunnerTransport())
+    )
+    runner = client.beta.messages.tool_runner(
+        messages=_user_messages("Clean up"), tools=[delete_records], stream=True, **CHAT_PARAMS
+    )
+    caught = []
+    with pytest.raises(AIGuardAbortError):
+        for stream in runner:
+            try:
+                for _ in stream:
+                    pass
+            except anthropic_sdk_buffered.APIStatusError as e:
+                caught.append(e)
+
+    assert len(caught) == 1
+    assert deleted == []
+    assert mock_execute_request.call_count == 2
+
+
+@pytest.mark.asyncio
+@patch("ddtrace.aiguard._api_client.AIGuardClient._execute_request")
+async def test_streaming_tool_runner_async_after_caught_block(mock_execute_request, anthropic_sdk_buffered):
+    """Async twin: a runner loop that catches the block never runs the tool calls of the blocked answer."""
+    if not hasattr(anthropic_sdk_buffered, "beta_async_tool"):
+        pytest.skip("the streaming tool runner needs the beta tool helpers")
+    mock_execute_request.side_effect = _block_then_allow()
+    deleted = []
+
+    @anthropic_sdk_buffered.beta_async_tool
+    async def delete_records(table: str) -> str:
+        """Delete every record of a table."""
+        deleted.append(table)
+        return "deleted"
+
+    client = anthropic_sdk_buffered.AsyncAnthropic(
+        api_key="<not-a-real-key>", http_client=httpx.AsyncClient(transport=_RunnerTransport())
+    )
+    runner = client.beta.messages.tool_runner(
+        messages=_user_messages("Clean up"), tools=[delete_records], stream=True, **CHAT_PARAMS
+    )
+    caught = []
+    with pytest.raises(AIGuardAbortError):
+        async for stream in runner:
+            try:
+                async for _ in stream:
+                    pass
+            except anthropic_sdk_buffered.APIStatusError as e:
+                caught.append(e)
+
+    assert len(caught) == 1
+    assert deleted == []
+    assert mock_execute_request.call_count == 2
 
 
 # ---------------------------------------------------------------------------

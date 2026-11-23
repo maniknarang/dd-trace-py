@@ -6,12 +6,14 @@ the stream is not buffered.
 """
 
 import asyncio
+import threading
 import time
 from unittest.mock import patch
 
 import pytest
 
 from ddtrace.aiguard import AIGuardAbortError
+from ddtrace.aiguard import AIGuardClientError
 from ddtrace.aiguard._listener import _make_openai_stream_wrappers
 from ddtrace.aiguard._streaming import BufferedAIGuardAsyncStream
 from ddtrace.aiguard._streaming import BufferedAIGuardStream
@@ -62,6 +64,26 @@ def test_chat_stream_sync_buffered_block(mock_execute_request, openai_client_str
             seen.append(chunk)
 
     assert seen == []  # security invariant: nothing reaches the caller before ALLOW
+    assert mock_execute_request.call_count == 2
+
+
+@patch("ddtrace.aiguard._api_client.AIGuardClient._execute_request")
+def test_chat_stream_sync_read_after_caught_block(mock_execute_request, openai_client_stream_buffered):
+    """Iterating a blocked stream again raises the block instead of yielding nothing, without a new evaluation."""
+    mock_execute_request.side_effect = [
+        mock_evaluate_response("ALLOW"),
+        mock_evaluate_response("DENY"),
+        mock_evaluate_response("ALLOW"),
+    ]
+
+    stream = openai_client_stream_buffered.chat.completions.create(
+        model=CHAT_MODEL, messages=_user_messages(), stream=True
+    )
+    with pytest.raises(AIGuardAbortError):
+        list(stream)
+    with pytest.raises(AIGuardAbortError):
+        list(stream)
+
     assert mock_execute_request.call_count == 2
 
 
@@ -264,7 +286,7 @@ def test_async_buffered_stream_without_asyncio_loop_evaluates_inline(decision):
 
 
 class _FinalMessageStream:
-    """Async stream with an Anthropic-style get_final_message that returns the full response."""
+    """Async stream with Anthropic-style accessors that return the full response."""
 
     def __init__(self):
         self._chunks = iter(["a", "b"])
@@ -278,7 +300,54 @@ class _FinalMessageStream:
         except StopIteration:
             raise StopAsyncIteration
 
+    @property
+    def text_stream(self):
+        async def text():
+            yield "full text"
+
+        return text()
+
     async def get_final_message(self):
+        return "full message"
+
+    async def get_final_text(self):
+        return "full text"
+
+    async def until_done(self):
+        return None
+
+    @property
+    def current_message_snapshot(self):
+        return "full message"
+
+
+class _SyncFinalMessageStream:
+    """Sync twin of _FinalMessageStream."""
+
+    def __init__(self):
+        self._chunks = iter(["a", "b"])
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._chunks)
+
+    @property
+    def text_stream(self):
+        return iter(["full text"])
+
+    def get_final_message(self):
+        return "full message"
+
+    def get_final_text(self):
+        return "full text"
+
+    def until_done(self):
+        return None
+
+    @property
+    def current_message_snapshot(self):
         return "full message"
 
 
@@ -309,6 +378,187 @@ async def test_async_buffered_stream_concurrent_and_later_callers_share_the_verd
             await stream.get_final_message()
 
     assert evaluated and all(response == ["a", "b"] for response in evaluated)
+
+
+_SYNC_READS = {
+    "iterate": lambda stream: list(stream),
+    "next": lambda stream: next(stream, None),
+    "text_stream": lambda stream: list(stream.text_stream),
+    "get_final_message": lambda stream: stream.get_final_message(),
+    "get_final_text": lambda stream: stream.get_final_text(),
+    "until_done": lambda stream: stream.until_done(),
+    "current_message_snapshot": lambda stream: stream.current_message_snapshot,
+}
+
+
+async def _async_iterate(stream):
+    return [chunk async for chunk in stream]
+
+
+async def _async_next(stream):
+    """Like next(stream, None) for an async stream."""
+    try:
+        return await stream.__anext__()
+    except StopAsyncIteration:
+        return None
+
+
+async def _async_text_stream(stream):
+    return [text async for text in stream.text_stream]
+
+
+async def _async_snapshot(stream):
+    return stream.current_message_snapshot
+
+
+_ASYNC_READS = {
+    "iterate": _async_iterate,
+    "next": _async_next,
+    "text_stream": _async_text_stream,
+    "get_final_message": lambda stream: stream.get_final_message(),
+    "get_final_text": lambda stream: stream.get_final_text(),
+    "until_done": lambda stream: stream.until_done(),
+    "current_message_snapshot": _async_snapshot,
+}
+
+# After the blocking verdict: a later verdict allows, AI Guard fails, or stream analysis is turned off.
+_LATER = ["allow", "client_error", "analysis_off"]
+
+
+def _block_once(later):
+    """Return the recorded evaluations and a stub that blocks on its first call."""
+    evaluated = []
+
+    def evaluate(response):
+        evaluated.append(response)
+        if len(evaluated) == 1:
+            raise AIGuardAbortError(action="DENY", reason="blocked")
+        if later == "client_error":
+            raise AIGuardClientError("AI Guard is unavailable")
+
+    return evaluated, evaluate
+
+
+@pytest.mark.parametrize("later", _LATER)
+@pytest.mark.parametrize("read", list(_SYNC_READS))
+def test_buffered_stream_read_after_block(read, later):
+    """Every read after a block raises it again, and nothing evaluates the response again to release it."""
+    evaluated, evaluate = _block_once(later)
+    analysis = {"enabled": True}
+    stream = BufferedAIGuardStream(
+        _SyncFinalMessageStream(), reconstruct=list, evaluate=evaluate, enabled=lambda: analysis["enabled"]
+    )
+
+    with pytest.raises(AIGuardAbortError) as blocked:
+        list(stream)
+    analysis["enabled"] = later != "analysis_off"
+    with pytest.raises(AIGuardAbortError) as again:
+        _SYNC_READS[read](stream)
+
+    assert type(again.value) is type(blocked.value)
+    assert evaluated == [["a", "b"]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("later", _LATER)
+@pytest.mark.parametrize("read", list(_ASYNC_READS))
+async def test_async_buffered_stream_read_after_block(read, later):
+    """Async twin: every read after a block raises it again, without a new evaluation."""
+    evaluated, evaluate = _block_once(later)
+    analysis = {"enabled": True}
+    stream = BufferedAIGuardAsyncStream(
+        _FinalMessageStream(), reconstruct=list, evaluate=evaluate, enabled=lambda: analysis["enabled"]
+    )
+
+    with pytest.raises(AIGuardAbortError) as blocked:
+        await _async_iterate(stream)
+    analysis["enabled"] = later != "analysis_off"
+    with pytest.raises(AIGuardAbortError) as again:
+        await _ASYNC_READS[read](stream)
+
+    assert type(again.value) is type(blocked.value)
+    assert evaluated == [["a", "b"]]
+
+
+class _NoVerdict(BaseException):
+    """Ends an evaluation without a verdict, like a timeout raised inside the AI Guard call."""
+
+
+def test_buffered_stream_evaluates_the_buffer_again_without_verdict():
+    """An evaluation that ends without a verdict keeps the drained buffer, and the next read evaluates it."""
+    evaluated = []
+
+    def evaluate(response):
+        evaluated.append(response)
+        if len(evaluated) == 1:
+            raise _NoVerdict()
+
+    stream = BufferedAIGuardStream(_SyncFinalMessageStream(), reconstruct=list, evaluate=evaluate, enabled=lambda: True)
+
+    with pytest.raises(_NoVerdict):
+        list(stream)
+    assert list(stream) == ["a", "b"]
+    assert evaluated == [["a", "b"], ["a", "b"]]
+
+
+@pytest.mark.asyncio
+async def test_async_buffered_stream_evaluates_the_buffer_again_after_cancel():
+    """A cancelled evaluation leaves the buffer pending: the snapshot is refused and the next read evaluates it."""
+    evaluated = []
+    started, release = threading.Event(), threading.Event()
+
+    def evaluate(response):
+        evaluated.append(response)
+        if len(evaluated) == 1:
+            # Allows once released, but the awaiting task is cancelled by then: this verdict is discarded.
+            started.set()
+            release.wait(5)
+            return
+        raise AIGuardAbortError(action="DENY", reason="blocked")
+
+    stream = BufferedAIGuardAsyncStream(
+        _FinalMessageStream(), reconstruct=list, evaluate=evaluate, enabled=lambda: True
+    )
+    reading = asyncio.ensure_future(stream.get_final_message())
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(reading, 0.01)
+    finally:
+        release.set()
+    assert reading.cancelled()
+
+    with pytest.raises(RuntimeError):
+        _ = stream.current_message_snapshot
+    with pytest.raises(AIGuardAbortError):
+        await stream.get_final_message()
+    with pytest.raises(AIGuardAbortError):
+        _ = stream.current_message_snapshot
+    assert evaluated == [["a", "b"], ["a", "b"]]
+
+
+@pytest.mark.asyncio
+async def test_async_buffered_stream_snapshot_while_evaluation_pending():
+    """Another task cannot read the snapshot while the evaluation runs; it is returned once the response is allowed."""
+    started, release = threading.Event(), threading.Event()
+
+    def evaluate(response):
+        started.set()
+        release.wait(5)
+
+    stream = BufferedAIGuardAsyncStream(
+        _FinalMessageStream(), reconstruct=list, evaluate=evaluate, enabled=lambda: True
+    )
+    reading = asyncio.ensure_future(stream.get_final_message())
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        with pytest.raises(RuntimeError):
+            _ = stream.current_message_snapshot
+    finally:
+        release.set()
+
+    assert await reading == "full message"
+    assert stream.current_message_snapshot == "full message"
 
 
 # ---------------------------------------------------------------------------

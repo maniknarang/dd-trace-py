@@ -1,0 +1,7 @@
+---
+fixes:
+  - |
+    AI Guard: Fixes an issue where, with ``DD_AI_GUARD_ANALYZE_STREAM_RESPONSES_ENABLED=true``, an
+    Anthropic streamed response that AI Guard blocks can still be read after the application catches
+    the block, for example with ``get_final_message()``, ``current_message_snapshot`` or the
+    streaming tool runner. Every later read of a blocked stream now raises the block again.
