@@ -1,0 +1,8 @@
+---
+fixes:
+  - |
+    AI Guard: Fixes the LiteLLM SDK integration: a blocked call now raises ``ddtrace.aiguard.AIGuardAbortError``
+    instead of ``litellm.BadRequestError`` (or ``None`` with ``litellm.drop_params``), and chat and text completions
+    are evaluated for every provider, including OpenAI on LiteLLM 1.108.1 and later. SDK calls that set the
+    ``guardrails`` argument now follow ``DD_AI_GUARD_BLOCK`` instead of the guardrail's ``block`` settings; set
+    ``DD_AI_GUARD_LITELLM_ENABLED=false`` to disable this evaluation.

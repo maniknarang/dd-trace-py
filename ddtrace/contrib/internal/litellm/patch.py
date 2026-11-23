@@ -83,32 +83,54 @@ def _handle_router_stream_response(resp, ctx, is_async=False):
 
 def traced_completion(func, instance, args, kwargs):
     event = _request_event(func.__name__, args, kwargs)
+    # Listeners of these events share the state of one call. A listener can stop the call with a
+    # BaseException, which dispatch always propagates.
+    state = {}
+    name = f"litellm.{event.operation}"
     if not kwargs.get("stream", False):
         with core.context_with_event(event):
-            event.response = func(*args, **kwargs)
-            return event.response
+            try:
+                core.dispatch(f"{name}.before", (state, args, kwargs))
+                event.response = func(*args, **kwargs)
+                core.dispatch(f"{name}.after", (state, args, kwargs, event.response))
+                return event.response
+            finally:
+                core.dispatch(f"{name}.finally", (state,))
     # The stream handler dispatches the ended event once the stream is consumed or closed.
     with core.context_with_event(event, dispatch_end_event=False) as ctx:
         try:
+            core.dispatch(f"{name}.before", (state, args, kwargs))
             resp = func(*args, **kwargs)
-        except Exception:
+        except BaseException:
             ctx.dispatch_ended_event(*sys.exc_info())
             raise
+        finally:
+            core.dispatch(f"{name}.finally", (state,))
         return make_traced_stream(resp, LiteLLMStreamHandler(ctx))
 
 
 async def traced_acompletion(func, instance, args, kwargs):
     event = _request_event(func.__name__, args, kwargs)
+    state = {}
+    name = f"litellm.{event.operation}"
     if not kwargs.get("stream", False):
         with core.context_with_event(event):
-            event.response = await func(*args, **kwargs)
-            return event.response
+            try:
+                core.dispatch(f"{name}.before", (state, args, kwargs))
+                event.response = await func(*args, **kwargs)
+                core.dispatch(f"{name}.after", (state, args, kwargs, event.response))
+                return event.response
+            finally:
+                core.dispatch(f"{name}.finally", (state,))
     with core.context_with_event(event, dispatch_end_event=False) as ctx:
         try:
+            core.dispatch(f"{name}.before", (state, args, kwargs))
             resp = await func(*args, **kwargs)
-        except Exception:
+        except BaseException:
             ctx.dispatch_ended_event(*sys.exc_info())
             raise
+        finally:
+            core.dispatch(f"{name}.finally", (state,))
         return make_traced_stream(resp, LiteLLMAsyncStreamHandler(ctx))
 
 
@@ -121,7 +143,7 @@ def traced_router_completion(func, instance, args, kwargs):
     with core.context_with_event(event, dispatch_end_event=False) as ctx:
         try:
             resp = func(*args, **kwargs)
-        except Exception:
+        except BaseException:
             ctx.dispatch_ended_event(*sys.exc_info())
             raise
         return _handle_router_stream_response(resp, ctx, is_async=False)
@@ -136,7 +158,7 @@ async def traced_router_acompletion(func, instance, args, kwargs):
     with core.context_with_event(event, dispatch_end_event=False) as ctx:
         try:
             resp = await func(*args, **kwargs)
-        except Exception:
+        except BaseException:
             ctx.dispatch_ended_event(*sys.exc_info())
             raise
         return _handle_router_stream_response(resp, ctx, is_async=True)

@@ -65,7 +65,8 @@ ddtrace/aiguard/
 ├── _streaming.py           # buffer-then-evaluate stream proxies
 ├── messages.py             # message formatting helpers
 └── integrations/           # provider listeners/converters + framework plugins
-    ├── litellm.py
+    ├── litellm.py          # LiteLLM proxy guardrail (DatadogAIGuardGuardrail)
+    ├── _litellm.py         # LiteLLM SDK listeners of the litellm contrib events
     ├── strands.py          # AIGuardStrandsPlugin / AIGuardStrandsHookProvider
     ├── _openai.py          # OpenAI common helpers (_wrap_abort_error)
     ├── _openai_chat.py     # Chat Completions API converters + listeners
@@ -234,7 +235,7 @@ logged at debug and ignored.
 
 ### 5. Double-scan avoidance (`_context.py`)
 
-A framework integration (LangChain, Strands, the LiteLLM proxy guardrail) and a
+A framework integration (LangChain, Strands, the LiteLLM SDK hook, the LiteLLM proxy guardrail) and a
 provider integration (OpenAI, Anthropic) can both fire for the same call. To
 avoid scanning twice, the framework claims the AI Guard context for its whole
 model call, and provider listeners short-circuit when `is_aiguard_context_active()`
@@ -245,13 +246,18 @@ returns `True`. The framework evaluates both the request and the response itself
 | LangChain `generate` / `agenerate` | `.before` to `.finally` |
 | LangChain `stream` / `astream` | iteration start to stream end (`.stream.started` / `.stream.finally`) |
 | Strands invocation | before-invocation to after-invocation |
+| LiteLLM SDK `completion` / `acompletion` / `text_completion` / `atext_completion` (not proxy requests) | `.before` to `.finally`; a stream until the stream object is returned |
 | LiteLLM proxy guardrail (chat and text completions, `pre_call` and `post_call` modes) | pre-call check to the end of the request (post-call hook, end of the model stream, or failure hook) |
 
 A claim is a shared object released by the handle `set_aiguard_context_active`
 returns, so a release from another asyncio task is seen by the claiming task.
 Strands keeps the handle on `invocation_state`; a LangChain generate keeps it on
 its `_CallScope`, and a stream on the per-stream state the contrib passes to
-both stream events.
+both stream events. The LiteLLM SDK hook keeps it in the per-call state the contrib passes to the
+three events of the call, so a litellm call made inside another one (SDK fallbacks) never releases
+the outer claim. It does not claim a call when a claim is active or when the kwargs have
+`proxy_server_request`, and it raises only the bare `AIGuardAbortError`: litellm and its Router
+catch, retry or wrap every `Exception`.
 
 The LiteLLM guardrail keeps the handle in a ContextVar of the request task. It claims only when
 the data has `proxy_server_request`, the request is a chat or text completion, and the `post_call`
@@ -260,7 +266,10 @@ provider listeners evaluate the prompt again. The proxy awaits the pre-call hook
 and copies that context into the model call. The SDK `guardrails` argument runs the hook in the caller
 task, and a `during_call` hook runs beside the model call: they do not claim. For other request
 types, and with only the `pre_call` mode, the guardrail does not claim, so the provider listeners
-keep their evaluations.
+keep their evaluations. Outside the proxy the guardrail never claims, so for data without
+`proxy_server_request` an active claim belongs to another integration (for example the LiteLLM SDK
+hook, which also claims the SDK calls that set the `guardrails` argument): the pre-call and post-call
+success hooks then skip their evaluation.
 
 In `post_call` mode, `DD_AI_GUARD_ANALYZE_STREAM_RESPONSES_ENABLED` controls a streamed chat or text
 answer. When it is on, the guardrail holds the answer, evaluates it, and can block it before the
@@ -301,6 +310,7 @@ AI Guard product. Span tags, metric names, and other product constants live in
 | `DD_AI_GUARD_OPENAI_ENABLED` | `true` | Per-provider kill switch for the OpenAI integration. |
 | `DD_AI_GUARD_ANTHROPIC_ENABLED` | `true` | Per-provider kill switch for the Anthropic integration. |
 | `DD_AI_GUARD_LANGCHAIN_ENABLED` | `true` | Per-framework kill switch for the LangChain integration. |
+| `DD_AI_GUARD_LITELLM_ENABLED` | `true` | Kill switch for the LiteLLM SDK hook; the LiteLLM proxy guardrail does not read it. |
 
 Truncation only affects what is reported on the span; the service always
 evaluates the full conversation. User-facing descriptions live in the AI Guard

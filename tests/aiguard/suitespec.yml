@@ -129,6 +129,7 @@ suites:
     paths:
       - '@bootstrap'
       - '@ai_guard'
+      - '@litellm'
       - '@openai'
       - tests/aiguard/litellm_guardrail/*
       - tests/aiguard/utils.py
@@ -147,3 +148,29 @@ suites:
         - name: ai_guard_litellm_guardrail
           python: ['3.10', '3.11', '3.12', '3.13', '3.14']
           dependencies: [pytest-asyncio, 'litellm[proxy]==1.82.6']
+  ai_guard_litellm:
+    # The LiteLLM SDK hook with plain litellm, without the proxy extras.
+    paths:
+      - '@bootstrap'
+      - '@ai_guard'
+      - '@litellm'
+      - '@openai'
+      - tests/aiguard/litellm/*
+      - tests/aiguard/utils.py
+      - tests/aiguard/suitespec.yml
+    matrix:
+      command: pytest {cmdargs} tests/aiguard/litellm/
+      # litellm downloads its model cost map when a test imports it. This setting makes litellm use its bundled map.
+      env:
+        LITELLM_LOCAL_MODEL_COST_MAP: 'True'
+      # fastuuid 0.14.0 cannot build on Python 3.15. The pinned rows keep openai 2.x, like the guardrail locks.
+      variants:
+        - name: ai_guard_litellm
+          python: ['3.10', '3.14']
+          dependencies: [pytest-asyncio, 'litellm==1.78.5', 'openai<3']
+        - name: ai_guard_litellm
+          python: ['3.10', '3.14']
+          dependencies: [pytest-asyncio, 'litellm==1.82.6', 'openai<3']
+        - name: ai_guard_litellm
+          python: ['3.10', '3.14']
+          dependencies: [pytest-asyncio, litellm]
