@@ -312,6 +312,23 @@ class GrpcTestCase(GrpcBaseTestCase):
         assert client_span.get_tag("grpc.status.code") == "StatusCode.RESOURCE_EXHAUSTED"
         assert client_span.duration is not None
 
+    def test_server_stream_generator_response_error_then_stopiteration(self):
+        # After RpcError the generator is closed. The next pull raises StopIteration
+        # and must leave the failure status in place.
+        with grpc.insecure_channel("127.0.0.1:%d" % (self._grpc_port)) as channel:
+            stub = HelloStub(grpc.intercept_channel(channel, _GeneratorResponseInterceptor()))
+            responses_iterator = stub.SayHelloTwice(HelloRequest(name="exception"))
+            assert next(responses_iterator).message == "first response"
+            with self.assertRaises(grpc.RpcError):
+                next(responses_iterator)
+            with self.assertRaises(StopIteration):
+                next(responses_iterator)
+
+        spans = self.get_spans_with_sync_and_assert(size=2)
+        client_span, server_span = spans
+        assert client_span.error == 1
+        assert client_span.get_tag("grpc.status.code") == "StatusCode.RESOURCE_EXHAUSTED"
+
     def test_server_stream_generator_response_dropped(self):
         # A generator dropped before the end still finishes its span.
         with grpc.insecure_channel("127.0.0.1:%d" % (self._grpc_port)) as channel:

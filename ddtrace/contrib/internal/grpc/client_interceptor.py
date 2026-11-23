@@ -163,7 +163,9 @@ class _WrappedResponseCallFuture(wrapt.ObjectProxy):
         except StopIteration:
             # A grpc rendezvous finishes the span through its done callback. Plain
             # iterators such as generators have none, so finish the span here.
-            if not hasattr(self.__wrapped__, "add_done_callback"):
+            # A generator that already raised is closed: the next pull is StopIteration,
+            # and must not overwrite the failure status recorded on that raise.
+            if not hasattr(self.__wrapped__, "add_done_callback") and not self._self_span.finished:
                 self._self_span._set_attribute(constants.GRPC_STATUS_CODE_KEY, str(grpc.StatusCode.OK))
                 self._self_span.finish()
             raise
