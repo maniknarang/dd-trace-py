@@ -1,5 +1,6 @@
 import collections
 from contextlib import contextmanager
+import weakref
 
 import grpc
 import wrapt
@@ -141,6 +142,9 @@ class _WrappedResponseCallFuture(wrapt.ObjectProxy):
         # Registers callback on the _MultiThreadedRendezvous future to finish
         # span in case StopIteration is never raised but RPC is terminated
         _handle_response(self._self_span, self.__wrapped__)
+        if not hasattr(wrapped, "add_done_callback"):
+            # A plain iterator has no done callback: finish the span if the caller drops it before the end.
+            weakref.finalize(self, span.finish).atexit = False
 
     def __iter__(self):
         return self
@@ -160,6 +164,7 @@ class _WrappedResponseCallFuture(wrapt.ObjectProxy):
             # A grpc rendezvous finishes the span through its done callback. Plain
             # iterators such as generators have none, so finish the span here.
             if not hasattr(self.__wrapped__, "add_done_callback"):
+                self._self_span._set_attribute(constants.GRPC_STATUS_CODE_KEY, str(grpc.StatusCode.OK))
                 self._self_span.finish()
             raise
         except grpc.RpcError as rpc_error:
@@ -167,6 +172,15 @@ class _WrappedResponseCallFuture(wrapt.ObjectProxy):
             # https://github.com/grpc/grpc/commit/8199aff7a66460fbc4e9a82ade2e95ef076fd8f9
             # handle as a response
             _handle_response(self._self_span, rpc_error)
+            if not hasattr(self.__wrapped__, "add_done_callback"):
+                # A plain iterator has no done callback to record the failure: record it here.
+                status_code = rpc_error.code() if callable(getattr(rpc_error, "code", None)) else None
+                if status_code is not None:
+                    self._self_span._set_attribute(constants.GRPC_STATUS_CODE_KEY, str(status_code))
+                _handle_error(self._self_span, rpc_error, status_code)
+                if not self._self_span.error:
+                    self._self_span.set_traceback()
+                self._self_span.finish()
             raise
         except Exception:
             # DEV: added for safety though should not be reached since wrapped response

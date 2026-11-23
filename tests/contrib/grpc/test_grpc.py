@@ -1,3 +1,4 @@
+import gc
 import threading
 import time
 
@@ -286,6 +287,43 @@ class GrpcTestCase(GrpcBaseTestCase):
         client_span, server_span = spans
         self._check_client_span(client_span, "grpc-client", "SayHelloTwice", "server_streaming")
         self._check_server_span(server_span, "grpc-server", "SayHelloTwice", "server_streaming")
+
+    def test_server_stream_generator_response(self):
+        # A plain generator response has no done callback: the span is finished on StopIteration.
+        with grpc.insecure_channel("127.0.0.1:%d" % (self._grpc_port)) as channel:
+            stub = HelloStub(grpc.intercept_channel(channel, _GeneratorResponseInterceptor()))
+            assert len(list(stub.SayHelloTwice(HelloRequest(name="test")))) == 2
+
+        spans = self.get_spans_with_sync_and_assert(size=2)
+        client_span, server_span = spans
+        self._check_client_span(client_span, "grpc-client", "SayHelloTwice", "server_streaming")
+        self._check_server_span(server_span, "grpc-server", "SayHelloTwice", "server_streaming")
+        assert client_span.duration is not None
+
+    def test_server_stream_generator_response_error(self):
+        with grpc.insecure_channel("127.0.0.1:%d" % (self._grpc_port)) as channel:
+            stub = HelloStub(grpc.intercept_channel(channel, _GeneratorResponseInterceptor()))
+            with self.assertRaises(grpc.RpcError):
+                list(stub.SayHelloTwice(HelloRequest(name="exception")))
+
+        spans = self.get_spans_with_sync_and_assert(size=2)
+        client_span, server_span = spans
+        assert client_span.error == 1
+        assert client_span.get_tag("grpc.status.code") == "StatusCode.RESOURCE_EXHAUSTED"
+        assert client_span.duration is not None
+
+    def test_server_stream_generator_response_dropped(self):
+        # A generator dropped before the end still finishes its span.
+        with grpc.insecure_channel("127.0.0.1:%d" % (self._grpc_port)) as channel:
+            stub = HelloStub(grpc.intercept_channel(channel, _GeneratorResponseInterceptor()))
+            responses_iterator = stub.SayHelloTwice(HelloRequest(name="test"))
+            assert next(responses_iterator).message == "first response"
+            del responses_iterator
+            gc.collect()
+
+        spans = self.get_spans_with_sync_and_assert(size=2)
+        client_span, server_span = spans
+        assert client_span.duration is not None
 
     def test_client_stream(self):
         requests_iterator = iter(HelloRequest(name=name) for name in ["first", "second"])
@@ -743,52 +781,8 @@ class _SpanActivationClientInterceptor(grpc.UnaryUnaryClientInterceptor):
         return self._intercept_call(continuation, client_call_details, request)
 
 
-def _generator_responses():
-    yield "a"
-    yield "b"
+class _GeneratorResponseInterceptor(grpc.UnaryStreamClientInterceptor):
+    """Returns the streamed response as a plain generator, like client wrapper libraries do."""
 
-
-class _FutureLikeIterator:
-    """Iterator with add_done_callback, like a grpc rendezvous, that never finishes the span itself."""
-
-    def __init__(self, items):
-        self._items = iter(items)
-        self.callbacks = []
-
-    def add_done_callback(self, fn):
-        self.callbacks.append(fn)
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        return next(self._items)
-
-
-def test_wrapped_response_call_future_generator_finishes_span(tracer):
-    from ddtrace.contrib.internal.grpc.client_interceptor import _WrappedResponseCallFuture
-
-    span = tracer.start_span("grpc.generator")
-    wrapped = _WrappedResponseCallFuture(_generator_responses(), span)
-
-    assert next(wrapped) == "a"
-    assert span.duration is None
-    assert next(wrapped) == "b"
-    assert span.duration is None
-    with pytest.raises(StopIteration):
-        next(wrapped)
-    assert span.duration is not None
-
-
-def test_wrapped_response_call_future_with_done_callback_does_not_finish_span(tracer):
-    from ddtrace.contrib.internal.grpc.client_interceptor import _WrappedResponseCallFuture
-
-    span = tracer.start_span("grpc.future")
-    response = _FutureLikeIterator(["a"])
-    wrapped = _WrappedResponseCallFuture(response, span)
-
-    assert len(response.callbacks) == 1
-    assert list(wrapped) == ["a"]
-    # the done callback owns span finishing for objects that support it
-    assert span.duration is None
-    span.finish()
+    def intercept_unary_stream(self, continuation, client_call_details, request):
+        return (r for r in continuation(client_call_details, request))
