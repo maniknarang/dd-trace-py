@@ -1,5 +1,8 @@
 import collections
 from contextlib import contextmanager
+import gc
+import queue
+import threading
 import weakref
 
 import grpc
@@ -28,6 +31,57 @@ from ddtrace.trace import tracer
 
 
 log = get_logger(__name__)
+
+# Cyclic GC runs finalizers on the thread that triggered collection. That thread can
+# already hold telemetry's non-reentrant _recorder_lock, and span.finish() takes it.
+# A refcount drop runs the finalizer outside GC and finishes inline. During collection
+# the span is handed to a daemon thread instead.
+_gc_depth = threading.local()
+_pending_span_finishes = queue.Queue()
+_finisher_started = False
+_finisher_lock = threading.Lock()
+
+
+def _on_gc_phase(phase, info):
+    depth = getattr(_gc_depth, "n", 0)
+    if phase == "start":
+        _gc_depth.n = depth + 1
+    elif phase == "stop" and depth:
+        _gc_depth.n = depth - 1
+
+
+if _on_gc_phase not in gc.callbacks:
+    gc.callbacks.append(_on_gc_phase)
+
+
+def _span_finisher():
+    while True:
+        span = _pending_span_finishes.get()
+        try:
+            span.finish()
+        except Exception:
+            log.debug("error finishing dropped grpc generator span", exc_info=True)
+        finally:
+            _pending_span_finishes.task_done()
+
+
+def _ensure_span_finisher():
+    global _finisher_started
+    if _finisher_started:
+        return
+    with _finisher_lock:
+        if _finisher_started:
+            return
+        threading.Thread(target=_span_finisher, name="ddtrace-grpc-generator-finish", daemon=True).start()
+        _finisher_started = True
+
+
+def _finish_dropped_generator_span(span):
+    if getattr(_gc_depth, "n", 0):
+        _ensure_span_finisher()
+        _pending_span_finishes.put(span)
+        return
+    span.finish()
 
 # DEV: Follows Python interceptors RFC laid out in
 # https://github.com/grpc/proposal/blob/master/L13-python-interceptors.md
@@ -144,7 +198,9 @@ class _WrappedResponseCallFuture(wrapt.ObjectProxy):
         _handle_response(self._self_span, self.__wrapped__)
         if not hasattr(wrapped, "add_done_callback"):
             # A plain iterator has no done callback: finish the span if the caller drops it before the end.
-            weakref.finalize(self, span.finish).atexit = False
+            # Not span.finish itself: a cyclic collection can run this while _recorder_lock is held.
+            _ensure_span_finisher()
+            weakref.finalize(self, _finish_dropped_generator_span, span).atexit = False
 
     def __iter__(self):
         return self

@@ -342,6 +342,21 @@ class GrpcTestCase(GrpcBaseTestCase):
         client_span, server_span = spans
         assert client_span.duration is not None
 
+    def test_generator_span_finish_is_deferred_during_gc(self):
+        from ddtrace.contrib.internal.grpc.client_interceptor import _finish_dropped_generator_span
+        from ddtrace.contrib.internal.grpc.client_interceptor import _gc_depth
+        from ddtrace.contrib.internal.grpc.client_interceptor import _pending_span_finishes
+
+        span = self.tracer.start_span("grpc.generator")
+        _gc_depth.n = 1
+        try:
+            _finish_dropped_generator_span(span)
+            assert span.duration is None
+        finally:
+            _gc_depth.n = 0
+        _pending_span_finishes.join()
+        assert span.duration is not None
+
     def test_client_stream(self):
         requests_iterator = iter(HelloRequest(name=name) for name in ["first", "second"])
 
